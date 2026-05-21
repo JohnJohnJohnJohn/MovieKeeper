@@ -68,15 +68,17 @@ class UnionFind:
 
 def extract_frames(
     file_path: PathLike,
-    num_frames: int = 5,
+    num_frames: int = 15,
     temp_dir: Optional[PathLike] = None,
 ) -> List[Path]:
     """Extract ``num_frames`` evenly spaced frames from ``file_path``.
 
     The first and last 10% of the timeline are skipped to avoid intros and
-    credits. Frames are written as JPEGs in ``temp_dir`` (a fresh temp
-    directory is created when not supplied). Caller is responsible for
-    cleaning up temp directories they passed in.
+    credits.  15 frames are sampled by default for robustness against
+    timeline drift (e.g. inserted ads or different intros).  Frames are
+    written as JPEGs in ``temp_dir`` (a fresh temp directory is created
+    when not supplied). Caller is responsible for cleaning up temp
+    directories they passed in.
     """
     src = Path(file_path)
     duration = get_video_duration(src)
@@ -149,9 +151,14 @@ def extract_frames(
 
 def compute_video_signature(
     file_path: PathLike,
-    num_frames: int = 5,
+    num_frames: int = 15,
 ) -> Optional[List]:
     """Compute a list of perceptual hashes for ``file_path``.
+
+    15 frames are sampled by default, providing robustness against timeline
+    drift (e.g. inserted ads or different intros).  Best-match pairing in
+    :func:`compute_similarity` then allows matching frames to find each
+    other regardless of their position in the timeline.
 
     Returns ``None`` if the signature can't be computed (e.g. ffmpeg failure
     or missing ``imagehash`` dependency).
@@ -181,7 +188,16 @@ def compute_video_signature(
 
 
 def compute_similarity(sig1: Sequence, sig2: Sequence) -> float:
-    """Average Hamming distance between two perceptual signatures.
+    """Compute similarity between two video signatures using best-match frame pairing.
+
+    For each frame hash in the shorter signature, find the closest matching
+    frame hash in the longer signature (lowest Hamming distance).  Return the
+    average of these best-match distances.
+
+    This handles timeline drift (e.g., inserted ads) because matching frames
+    will find each other regardless of their position in the timeline.  The
+    algorithm is resilient to a few non-matching frames — the ad frames
+    themselves won't match, but the movie frames will.
 
     Returns ``float('inf')`` when either signature is empty so that mismatched
     inputs cannot accidentally be considered duplicates.
@@ -189,11 +205,48 @@ def compute_similarity(sig1: Sequence, sig2: Sequence) -> float:
     if not sig1 or not sig2:
         return float("inf")
 
-    pairs = min(len(sig1), len(sig2))
-    total = 0
-    for i in range(pairs):
-        total += sig1[i] - sig2[i]  # imagehash defines __sub__ as Hamming dist
-    return total / pairs
+    # Use the shorter signature as the query side.
+    if len(sig1) <= len(sig2):
+        query, target = sig1, sig2
+    else:
+        query, target = sig2, sig1
+
+    total_best = 0
+    for q_hash in query:
+        best = min(q_hash - t_hash for t_hash in target)  # Hamming dist
+        total_best += best
+    return total_best / len(query)
+
+
+def _best_match_details(
+    sig1: Sequence, sig2: Sequence
+) -> Tuple[float, float]:
+    """Return (average best-match distance, good-match ratio) for two signatures.
+
+    *average best-match distance*: mean of the per-frame minimum Hamming
+    distances (see :func:`compute_similarity`).
+
+    *good-match ratio*: fraction of query frames whose best-match distance
+    is ``<= 8``.  This measures what proportion of frames found a close
+    counterpart in the other video.
+    """
+    if not sig1 or not sig2:
+        return float("inf"), 0.0
+
+    if len(sig1) <= len(sig2):
+        query, target = sig1, sig2
+    else:
+        query, target = sig2, sig1
+
+    best_distances: List[int] = []
+    for q_hash in query:
+        best = min(q_hash - t_hash for t_hash in target)
+        best_distances.append(best)
+
+    avg_distance = sum(best_distances) / len(best_distances)
+    good_matches = sum(1 for d in best_distances if d <= 8)
+    good_ratio = good_matches / len(best_distances)
+    return avg_distance, good_ratio
 
 
 def find_perceptual_duplicates(
@@ -203,10 +256,21 @@ def find_perceptual_duplicates(
 ) -> List[List[Path]]:
     """Find perceptual duplicate groups across ``file_paths``.
 
-    Two files are considered duplicates when their average frame Hamming
-    distance is ``<= threshold`` and their durations differ by no more than
-    ``duration_tolerance`` seconds. Groups are formed transitively via
-    union-find and only groups with more than one member are returned.
+    Two files are considered duplicates when **either** of these conditions
+    holds (and their durations differ by no more than
+    ``duration_tolerance`` seconds):
+
+    1. Their average best-match Hamming distance is ``<= threshold``.
+    2. At least 60 % of frames have a good match (distance ``<= 8``).
+
+    Best-match pairing means each frame in the shorter signature is paired
+    with its closest counterpart in the longer one, regardless of position.
+    This handles timeline drift caused by inserted ads or different intros.
+    The algorithm is resilient to a few non-matching frames — ad frames
+    won't match, but the actual movie frames will.
+
+    Groups are formed transitively via union-find and only groups with more
+    than one member are returned.
     """
     paths = [Path(p) for p in file_paths]
     print(f"Computing perceptual signatures for {len(paths)} file(s) ...")
@@ -232,8 +296,10 @@ def find_perceptual_duplicates(
             if dur_a is not None and dur_b is not None:
                 if abs(dur_a - dur_b) > duration_tolerance:
                     continue
-            distance = compute_similarity(signatures[a], signatures[b])
-            if distance <= threshold:
+            avg_distance, good_ratio = _best_match_details(
+                signatures[a], signatures[b]
+            )
+            if avg_distance <= threshold or good_ratio >= 0.6:
                 uf.union(a, b)
 
     groups: List[List[Path]] = [g for g in uf.groups() if len(g) > 1]
