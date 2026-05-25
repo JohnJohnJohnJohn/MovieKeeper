@@ -7,16 +7,20 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-try:  # pragma: no cover - optional dependency import
+try:
     import imagehash
     from PIL import Image
-except ImportError:  # pragma: no cover - handled at runtime
+except ImportError:
     imagehash = None  # type: ignore[assignment]
     Image = None  # type: ignore[assignment]
 
-from .utils import get_video_duration
+if TYPE_CHECKING:
+    from .index import VideoIndex
+
+from .index import DEFAULT_PERCEPTUAL_FRAMES, compute_content_fingerprint
+from .utils import get_video_duration, get_video_metadata
 
 PathLike = Union[str, Path]
 
@@ -40,7 +44,6 @@ class UnionFind:
 
     def find(self, item):
         self.add(item)
-        # Path compression.
         root = item
         while self._parent[root] != root:
             root = self._parent[root]
@@ -71,15 +74,7 @@ def extract_frames(
     num_frames: int = 15,
     temp_dir: Optional[PathLike] = None,
 ) -> List[Path]:
-    """Extract ``num_frames`` evenly spaced frames from ``file_path``.
-
-    The first and last 10% of the timeline are skipped to avoid intros and
-    credits.  15 frames are sampled by default for robustness against
-    timeline drift (e.g. inserted ads or different intros).  Frames are
-    written as JPEGs in ``temp_dir`` (a fresh temp directory is created
-    when not supplied). Caller is responsible for cleaning up temp
-    directories they passed in.
-    """
+    """Extract evenly spaced frames from ``file_path``."""
     src = Path(file_path)
     duration = get_video_duration(src)
     if not duration or duration <= 0:
@@ -143,7 +138,6 @@ def extract_frames(
             frame_paths.append(frame_path)
 
     if owns_dir and not frame_paths:
-        # Nothing extracted — clean up our private temp dir.
         shutil.rmtree(out_dir, ignore_errors=True)
 
     return frame_paths
@@ -151,18 +145,9 @@ def extract_frames(
 
 def compute_video_signature(
     file_path: PathLike,
-    num_frames: int = 15,
+    num_frames: int = DEFAULT_PERCEPTUAL_FRAMES,
 ) -> Optional[List]:
-    """Compute a list of perceptual hashes for ``file_path``.
-
-    15 frames are sampled by default, providing robustness against timeline
-    drift (e.g. inserted ads or different intros).  Best-match pairing in
-    :func:`compute_similarity` then allows matching frames to find each
-    other regardless of their position in the timeline.
-
-    Returns ``None`` if the signature can't be computed (e.g. ffmpeg failure
-    or missing ``imagehash`` dependency).
-    """
+    """Compute a list of perceptual hashes for ``file_path``."""
     if imagehash is None or Image is None:
         log.error("imagehash / Pillow not installed; cannot compute perceptual hash")
         return None
@@ -188,24 +173,9 @@ def compute_video_signature(
 
 
 def compute_similarity(sig1: Sequence, sig2: Sequence) -> float:
-    """Compute similarity between two video signatures using best-match frame pairing.
-
-    For each frame hash in the shorter signature, find the closest matching
-    frame hash in the longer signature (lowest Hamming distance).  Return the
-    average of these best-match distances.
-
-    This handles timeline drift (e.g., inserted ads) because matching frames
-    will find each other regardless of their position in the timeline.  The
-    algorithm is resilient to a few non-matching frames — the ad frames
-    themselves won't match, but the movie frames will.
-
-    Returns ``float('inf')`` when either signature is empty so that mismatched
-    inputs cannot accidentally be considered duplicates.
-    """
     if not sig1 or not sig2:
         return float("inf")
 
-    # Use the shorter signature as the query side.
     if len(sig1) <= len(sig2):
         query, target = sig1, sig2
     else:
@@ -213,23 +183,12 @@ def compute_similarity(sig1: Sequence, sig2: Sequence) -> float:
 
     total_best = 0
     for q_hash in query:
-        best = min(q_hash - t_hash for t_hash in target)  # Hamming dist
+        best = min(q_hash - t_hash for t_hash in target)
         total_best += best
     return total_best / len(query)
 
 
-def _best_match_details(
-    sig1: Sequence, sig2: Sequence
-) -> Tuple[float, float]:
-    """Return (average best-match distance, good-match ratio) for two signatures.
-
-    *average best-match distance*: mean of the per-frame minimum Hamming
-    distances (see :func:`compute_similarity`).
-
-    *good-match ratio*: fraction of query frames whose best-match distance
-    is ``<= 8``.  This measures what proportion of frames found a close
-    counterpart in the other video.
-    """
+def _best_match_details(sig1: Sequence, sig2: Sequence) -> Tuple[float, float]:
     if not sig1 or not sig2:
         return float("inf"), 0.0
 
@@ -249,42 +208,86 @@ def _best_match_details(
     return avg_distance, good_ratio
 
 
+def _serialize_phash(page_hash) -> str:
+    return str(page_hash)
+
+
+def _deserialize_phash(value: str):
+    if imagehash is None:
+        return None
+    return imagehash.hex_to_hash(value)
+
+
 def find_perceptual_duplicates(
     file_paths: Iterable[PathLike],
     threshold: int = 10,
     duration_tolerance: float = 60.0,
+    index: Optional["VideoIndex"] = None,
+    *,
+    use_cache: bool = True,
+    num_frames: int = DEFAULT_PERCEPTUAL_FRAMES,
 ) -> List[List[Path]]:
-    """Find perceptual duplicate groups across ``file_paths``.
-
-    Two files are considered duplicates when **either** of these conditions
-    holds (and their durations differ by no more than
-    ``duration_tolerance`` seconds):
-
-    1. Their average best-match Hamming distance is ``<= threshold``.
-    2. At least 60 % of frames have a good match (distance ``<= 8``).
-
-    Best-match pairing means each frame in the shorter signature is paired
-    with its closest counterpart in the longer one, regardless of position.
-    This handles timeline drift caused by inserted ads or different intros.
-    The algorithm is resilient to a few non-matching frames — ad frames
-    won't match, but the actual movie frames will.
-
-    Groups are formed transitively via union-find and only groups with more
-    than one member are returned.
-    """
+    """Find perceptual duplicate groups across ``file_paths``."""
     paths = [Path(p) for p in file_paths]
-    print(f"Computing perceptual signatures for {len(paths)} file(s) ...")
+    if len(paths) < 2:
+        return []
 
+    print(f"Computing perceptual signatures for {len(paths)} file(s) ...")
     signatures: Dict[Path, List] = {}
     durations: Dict[Path, Optional[float]] = {}
-    for index, path in enumerate(paths, start=1):
-        print(f"  [{index}/{len(paths)}] signature for {path.name}")
-        sig = compute_video_signature(path)
-        if sig is None:
-            log.info("No signature for %s; skipping", path)
-            continue
-        signatures[path] = sig
-        durations[path] = get_video_duration(path)
+    cache_hits = 0
+
+    for step, path in enumerate(paths, start=1):
+        sig: Optional[List] = None
+        record = index.get(path) if index is not None else None
+
+        if (
+            use_cache
+            and index is not None
+            and record
+            and record.perceptual_hashes
+            and record.perceptual_num_frames == num_frames
+            and index.is_content_cache_hit(path)
+        ):
+            sig = [
+                deserialized
+                for value in record.perceptual_hashes
+                if (deserialized := _deserialize_phash(value)) is not None
+            ]
+            if sig:
+                cache_hits += 1
+                print(f"  [{step}/{len(paths)}] cached signature {path.name}")
+                durations[path] = record.duration_sec
+                signatures[path] = sig
+                continue
+
+        print(f"  [{step}/{len(paths)}] signature for {path.name}")
+        sig = compute_video_signature(path, num_frames=num_frames)
+        meta = get_video_metadata(path) or {}
+        durations[path] = meta.get("duration_sec")
+
+        if sig:
+            signatures[path] = sig
+            if index is not None:
+                index.upsert(
+                    path,
+                    content_fingerprint=compute_content_fingerprint(path),
+                    duration_sec=meta.get("duration_sec"),
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                    bit_rate=meta.get("bit_rate"),
+                    video_codec=meta.get("video_codec"),
+                    audio_codec=meta.get("audio_codec"),
+                    perceptual_hashes=[_serialize_phash(value) for value in sig],
+                    perceptual_num_frames=num_frames,
+                )
+
+    if cache_hits:
+        print(f"Reused perceptual cache for {cache_hits} video(s).")
+
+    if len(signatures) < 2:
+        print("Not enough signatures to compare.")
+        return []
 
     keys: List[Path] = list(signatures.keys())
     uf: UnionFind = UnionFind(keys)
@@ -305,16 +308,3 @@ def find_perceptual_duplicates(
     groups: List[List[Path]] = [g for g in uf.groups() if len(g) > 1]
     print(f"Found {len(groups)} perceptual-duplicate group(s).")
     return groups
-
-
-__all__ = [
-    "UnionFind",
-    "extract_frames",
-    "compute_video_signature",
-    "compute_similarity",
-    "find_perceptual_duplicates",
-]
-
-
-# Convenience tuple type for callers that want both keep + remove information.
-PerceptualGroup = Tuple[Path, List[Path]]

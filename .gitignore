@@ -24,5 +24,6 @@ env/
 Thumbs.db
 
 # Project specific
+.movie_keeper/
 .movie_keeper_trash/
 *.log

@@ -15,19 +15,10 @@ DEFAULT_TRASH_DIR_NAME = ".movie_keeper_trash"
 
 
 def setup_logging(log_file: Optional[PathLike] = None) -> logging.Logger:
-    """Configure Python logging to the console and optionally a file.
-
-    Args:
-        log_file: Optional path to a file. If supplied, logs are also written
-            to this file in addition to stderr.
-
-    Returns:
-        The configured root logger.
-    """
+    """Configure Python logging to the console and optionally a file."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    # Clear existing handlers to keep configuration idempotent.
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
 
@@ -52,21 +43,13 @@ def setup_logging(log_file: Optional[PathLike] = None) -> logging.Logger:
     return logger
 
 
-def move_to_trash(file_path: PathLike, trash_dir: Optional[PathLike] = None) -> Optional[Path]:
-    """Move a file to a trash directory rather than deleting it.
-
-    The trash directory is created if it does not exist. If a file with the
-    same name already lives in the trash dir, a numeric suffix is appended.
-
-    Args:
-        file_path: Path of the file to move.
-        trash_dir: Destination trash directory. Defaults to
-            ``<file parent>/.movie_keeper_trash``.
-
-    Returns:
-        The new path inside the trash directory, or ``None`` if the source
-        file does not exist.
-    """
+def move_to_trash(
+    file_path: PathLike,
+    trash_dir: Optional[PathLike] = None,
+    *,
+    library_root: Optional[PathLike] = None,
+) -> Optional[Path]:
+    """Move a file to a trash directory rather than deleting it."""
     src = Path(file_path)
     log = logging.getLogger(__name__)
 
@@ -79,12 +62,20 @@ def move_to_trash(file_path: PathLike, trash_dir: Optional[PathLike] = None) -> 
     else:
         trash_path = Path(trash_dir)
 
-    trash_path.mkdir(parents=True, exist_ok=True)
+    if library_root is not None:
+        try:
+            relative = src.resolve().relative_to(Path(library_root).resolve())
+            target = trash_path / relative
+        except ValueError:
+            target = trash_path / src.name
+    else:
+        target = trash_path / src.name
 
-    target = trash_path / src.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+
     counter = 1
     while target.exists():
-        target = trash_path / f"{src.stem}__{counter}{src.suffix}"
+        target = target.parent / f"{target.stem}__{counter}{target.suffix}"
         counter += 1
 
     try:
@@ -96,7 +87,12 @@ def move_to_trash(file_path: PathLike, trash_dir: Optional[PathLike] = None) -> 
         return None
 
 
-def _run_ffprobe(args: list, file_path: PathLike) -> Optional[Dict[str, Any]]:
+def _run_ffprobe(
+    args: list,
+    file_path: PathLike,
+    *,
+    quiet: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Run ffprobe with the supplied args and parse JSON output."""
     log = logging.getLogger(__name__)
     cmd = ["ffprobe", "-v", "error", *args, "-of", "json", str(file_path)]
@@ -106,19 +102,34 @@ def _run_ffprobe(args: list, file_path: PathLike) -> Optional[Dict[str, Any]]:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError:
         log.error("ffprobe not found on PATH")
         return None
     except subprocess.CalledProcessError as exc:
-        log.warning("ffprobe failed for %s: %s", file_path, exc.stderr.strip())
+        if not quiet:
+            log.warning("ffprobe failed for %s: %s", file_path, exc.stderr.strip())
         return None
 
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        log.warning("Could not parse ffprobe output for %s: %s", file_path, exc)
+        if not quiet:
+            log.warning("Could not parse ffprobe output for %s: %s", file_path, exc)
         return None
+
+
+def video_is_readable(file_path: PathLike, *, quiet: bool = True) -> bool:
+    """Return True when ffprobe can read at least one video stream."""
+    data = _run_ffprobe(
+        ["-select_streams", "v:0", "-show_entries", "stream=codec_type"],
+        file_path,
+        quiet=quiet,
+    )
+    streams = (data or {}).get("streams") or []
+    return any(stream.get("codec_type") == "video" for stream in streams)
 
 
 def get_video_duration(file_path: PathLike) -> Optional[float]:
@@ -140,20 +151,21 @@ def get_video_duration(file_path: PathLike) -> Optional[float]:
         return None
 
 
-def get_video_metadata(file_path: PathLike) -> Optional[Dict[str, Any]]:
-    """Return a dict with ``width``, ``height``, and ``bit_rate``.
-
-    Resolution comes from the first video stream; bit_rate falls back to
-    ``format.bit_rate`` if the stream does not report it.
-    """
+def get_video_metadata(
+    file_path: PathLike,
+    *,
+    quiet: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Return video metadata including codecs and duration."""
     data = _run_ffprobe(
         [
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,bit_rate:format=bit_rate",
+            "stream=width,height,bit_rate,codec_name,codec_type:format=bit_rate,duration",
         ],
         file_path,
+        quiet=quiet,
     )
     if not data:
         return None
@@ -163,20 +175,34 @@ def get_video_metadata(file_path: PathLike) -> Optional[Dict[str, Any]]:
     if not streams:
         return None
 
-    stream = streams[0]
-    width = stream.get("width")
-    height = stream.get("height")
+    video_stream = streams[0]
+    width = video_stream.get("width")
+    height = video_stream.get("height")
 
-    bit_rate_raw = stream.get("bit_rate") or fmt.get("bit_rate")
+    bit_rate_raw = video_stream.get("bit_rate") or fmt.get("bit_rate")
     try:
         bit_rate = int(bit_rate_raw) if bit_rate_raw is not None else None
     except (TypeError, ValueError):
         bit_rate = None
 
+    duration_raw = fmt.get("duration")
+    try:
+        duration_sec = float(duration_raw) if duration_raw is not None else None
+    except (TypeError, ValueError):
+        duration_sec = None
+
+    audio_codec: Optional[str] = None
+    for stream in data.get("streams") or []:
+        if stream.get("codec_type") == "audio" and audio_codec is None:
+            audio_codec = stream.get("codec_name")
+
     return {
         "width": int(width) if width is not None else None,
         "height": int(height) if height is not None else None,
         "bit_rate": bit_rate,
+        "duration_sec": duration_sec,
+        "video_codec": video_stream.get("codec_name"),
+        "audio_codec": audio_codec,
     }
 
 
@@ -198,3 +224,26 @@ def format_size(num_bytes: float) -> str:
         size /= 1024.0
 
     return f"{sign}{size:.2f} {units[-1]}"
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    """Return a compact human-readable duration."""
+    if seconds is None or seconds <= 0:
+        return "unknown duration"
+
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def format_bitrate(bps: Optional[int]) -> str:
+    if not bps:
+        return "unknown bitrate"
+    if bps >= 1_000_000:
+        return f"{bps / 1_000_000:.1f} Mbps"
+    return f"{bps / 1000:.0f} Kbps"
