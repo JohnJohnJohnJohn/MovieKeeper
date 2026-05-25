@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .naming import standardize_stem
-from .utils import get_video_duration, move_to_trash
+from .utils import get_video_duration, move_to_trash, video_is_readable
 
 log = logging.getLogger(__name__)
 
@@ -181,6 +181,15 @@ def find_part_merge_groups(
     return merge_groups
 
 
+def unreadable_parts(group: PartMergeGroup) -> List[Path]:
+    """Return source files that ffprobe/ffmpeg cannot read."""
+    return [
+        info.file
+        for info in group.parts
+        if not video_is_readable(info.file, quiet=True)
+    ]
+
+
 def unique_file_path(parent: Path, filename: str) -> Path:
     candidate = parent / filename
     counter = 2
@@ -245,9 +254,25 @@ def _merge_with_ffmpeg(
     cmd.append(str(output))
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        log.warning("ffmpeg concat failed (%s): %s", output.name, exc)
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        log.error("ffmpeg not found on PATH; cannot merge into %s", output.name)
+        list_path.unlink(missing_ok=True)
+        return False
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        log.warning(
+            "ffmpeg concat failed (%s): %s",
+            output.name,
+            stderr or exc,
+        )
         list_path.unlink(missing_ok=True)
         return False
     finally:
@@ -268,6 +293,12 @@ def merge_part_group(
 
     if dry_run:
         return output
+
+    bad_parts = unreadable_parts(group)
+    if bad_parts:
+        for path in bad_parts:
+            log.error("Cannot merge unreadable part: %s", path)
+        return None
 
     if _merge_with_ffmpeg(group.source_files, output, reencode=False):
         pass

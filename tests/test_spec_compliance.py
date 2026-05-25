@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from movie_keeper.converter import (
@@ -12,7 +13,8 @@ from movie_keeper.converter import (
     needs_conversion,
 )
 from movie_keeper.naming import file_name_is_standard, standardize_stem
-from movie_keeper.parts import find_part_merge_groups, parse_part_name
+from movie_keeper.parts import find_part_merge_groups, parse_part_name, unreadable_parts
+from movie_keeper.parts import PartMergeGroup, PartInfo
 from movie_keeper.resolver import rank_videos_for_keep
 from movie_keeper.tagger import (
     TagProfile,
@@ -46,6 +48,28 @@ class PartsTests(unittest.TestCase):
             Path("Movie_part_3.mkv"),
         ]
         self.assertEqual(find_part_merge_groups(files), [])
+
+
+class PartsReadabilityTests(unittest.TestCase):
+    def test_unreadable_parts_detects_bad_files(self) -> None:
+        good = Path("Movie-1.mp4")
+        bad = Path("Movie-2.mp4")
+        group = PartMergeGroup(
+            parts=(
+                PartInfo(file=good, prefix="Movie-", suffix="", part=1),
+                PartInfo(file=bad, prefix="Movie-", suffix="", part=2),
+            )
+        )
+
+        def fake_readable(path: Path, *, quiet: bool = True) -> bool:
+            del quiet
+            return path == good
+
+        with unittest.mock.patch(
+            "movie_keeper.parts.video_is_readable",
+            side_effect=fake_readable,
+        ):
+            self.assertEqual(unreadable_parts(group), [bad])
 
 
 class TaggerTests(unittest.TestCase):

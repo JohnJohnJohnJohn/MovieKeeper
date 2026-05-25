@@ -17,7 +17,12 @@ from movie_keeper.converter import (
 from movie_keeper.utils import video_is_readable
 from movie_keeper.hasher import find_exact_duplicates, select_file_to_keep
 from movie_keeper.index import VideoIndex, index_file_for
-from movie_keeper.parts import PartMergeGroup, find_part_merge_groups, merge_part_group
+from movie_keeper.parts import (
+    PartMergeGroup,
+    find_part_merge_groups,
+    merge_part_group,
+    unreadable_parts,
+)
 from movie_keeper.perceptual import find_perceptual_duplicates
 from movie_keeper.resolver import get_quality_score, rank_videos_for_keep
 from movie_keeper.scanner import scan_directory
@@ -543,7 +548,10 @@ def _phase_standardization(
 def _format_part_merge_group(group: PartMergeGroup) -> str:
     parts = []
     for info in group.parts:
-        meta = get_video_metadata(info.file) or {}
+        if not video_is_readable(info.file, quiet=True):
+            parts.append(f"{info.file.name} (unreadable/corrupt)")
+            continue
+        meta = get_video_metadata(info.file, quiet=True) or {}
         duration = format_duration(meta.get("duration_sec"))
         parts.append(f"{info.file.name} ({duration})")
     return " + ".join(parts)
@@ -581,6 +589,16 @@ def _phase_combine_parts(
             f"  {_color('MERGE', 'magenta')} -> {merged_name} "
             f"({total_duration} total)"
         )
+
+        bad_parts = unreadable_parts(group)
+        if bad_parts:
+            for path in bad_parts:
+                _err(f"  Unreadable/corrupt part: {path.name}")
+            _warn(
+                "  Skipping merge. Re-download or repair the bad part(s) "
+                "before trying again."
+            )
+            continue
 
         if dry_run:
             _warn("  Dry run: would prompt to merge this group.")
